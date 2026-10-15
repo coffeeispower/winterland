@@ -1,19 +1,19 @@
 import 'package:hooks/hooks.dart';
 
-import 'lib/odin_builder.dart';
+import 'lib/zig_builder.dart';
 
 import 'package:code_assets/code_assets.dart';
 
 void main(List<String> arguments) async {
   await build(arguments, (input, output) async {
-    await OdinBuilder.library(
+    await ZigBuilder.library(
       name: 'winterland_shovel',
       assetName: 'winterland_shovel.dart',
       sourceDirectory: '../winterland_shovel/',
-      target: resolveOdinTarget(input.config.code),
-      odinExecutable: String.fromEnvironment(
-        "ODIN_EXECUTABLE",
-        defaultValue: "odin",
+      target: resolveZigTarget(input.config.code),
+      zigExecutable: String.fromEnvironment(
+        'ZIG_EXECUTABLE',
+        defaultValue: 'zig',
       ),
     ).run(input: input, output: output);
   });

@@ -1,0 +1,3 @@
+[submodule "winterland_shovel/ardos"]
+	path = winterland_shovel/ardos
+	url = https://github.com/ardos-os/ardos
