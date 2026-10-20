@@ -1,0 +1,7 @@
+rust_input: crate::api
+rust_root: ../winterland_shovel/
+rust_features:
+  - flutter_rust_bridge
+dart_output: lib/src/rust/
+web: false
+enable_lifetime: true

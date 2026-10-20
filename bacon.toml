@@ -1,8 +1,0 @@
-[jobs.check]
-command = ["just", "build"]
-need_stdout = true
-watch = ["winterland_shovel/src", "winterland_shovel/build.zig", "winterland_shovel/build.zig.zon"]
-[jobs.test]
-command = ["just", "test", "outputs"]
-need_stdout = true
-watch = ["winterland_shovel/src", "winterland_shovel/build.zig", "winterland_shovel/build.zig.zon"]
