@@ -1,48 +1,15 @@
-use crate::internal_json::{parser, types::Message as NixMessage};
-use crate::{DependencyGraph, Node, OutputError, QueryProgressKind, ShovelConfig};
+use super::nix_command;
+use crate::internal_json::{parser, Progress, ProgressKind};
+use crate::{DependencyGraph, Node, OutputError, ShovelConfig};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 use tokio_util::io::SyncIoBridge;
 
 #[cfg(feature = "flutter_rust_bridge")]
 use crate::frb_generated::StreamSink;
 
-/// Progress emitted while Nix evaluates a derivation build plan.
-#[derive(Debug)]
-#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb())]
-pub struct BuilderProgress {
-    /// The phase represented by this event.
-    pub kind: QueryProgressKind,
-    /// The input description or output path associated with the event.
-    pub value: String,
-    /// Number of bytes downloaded, when this is a byte-progress event.
-    pub done: Option<u64>,
-    /// Expected number of bytes, when known.
-    pub expected: Option<u64>,
-    /// Number of active transfers reported by Nix.
-    pub running: Option<u64>,
-    /// Number of failed transfers reported by Nix.
-    pub failed: Option<u64>,
-    /// The evaluated derivation graph for the completed event.
-    pub graph: Option<DependencyGraph>,
-}
-
-impl BuilderProgress {
-    fn phase(kind: QueryProgressKind, value: String) -> Self {
-        Self {
-            kind,
-            value,
-            done: None,
-            expected: None,
-            running: None,
-            failed: None,
-            graph: None,
-        }
-    }
-}
+const METADATA_EXPRESSION: &str = include_str!("metadata-prober.nix");
 
 /// A builder for one derivation/output selected from an output tree.
 ///
@@ -124,20 +91,21 @@ impl<'tree> Builder<'tree> {
     /// This only evaluates the flake and inspects its derivations. It does not
     /// build any store paths.
     #[cfg(feature = "flutter_rust_bridge")]
-    pub async fn show(&self, sink: StreamSink<BuilderProgress>) -> Result<(), OutputError> {
+    pub async fn show(&self, sink: StreamSink<Progress>) -> Result<(), OutputError> {
         let graph = self
             .show_with_progress(|event| {
                 let _ = sink.add(event);
             })
             .await?;
-        let _ = sink.add(BuilderProgress {
-            kind: QueryProgressKind::Completed,
+        let _ = sink.add(Progress {
+            kind: ProgressKind::Completed,
             value: String::new(),
             done: None,
             expected: None,
             running: None,
             failed: None,
             graph: Some(graph),
+            tree: None,
         });
         Ok(())
     }
@@ -146,27 +114,28 @@ impl<'tree> Builder<'tree> {
     #[cfg(not(feature = "flutter_rust_bridge"))]
     pub async fn show(
         &self,
-        mut on_progress: impl FnMut(BuilderProgress),
+        mut on_progress: impl FnMut(Progress),
     ) -> Result<DependencyGraph, OutputError> {
         let graph = self.show_with_progress(&mut on_progress).await?;
-        on_progress(BuilderProgress {
-            kind: QueryProgressKind::Completed,
+        on_progress(Progress {
+            kind: ProgressKind::Completed,
             value: String::new(),
             done: None,
             expected: None,
             running: None,
             failed: None,
             graph: None,
+            tree: None,
         });
         Ok(graph)
     }
 
     async fn show_with_progress(
         &self,
-        mut report: impl FnMut(BuilderProgress),
+        mut report: impl FnMut(Progress),
     ) -> Result<DependencyGraph, OutputError> {
         let flake_url = self.get_flake_url();
-        let mut child = Command::new("nix")
+        let mut child = nix_command::command()
             .args([
                 "derivation",
                 "show",
@@ -192,7 +161,7 @@ impl<'tree> Builder<'tree> {
             stderr: "nix stderr was not captured".to_owned(),
         })?;
         let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
-        let stderr_task = tokio::spawn(read_stderr(stderr, message_sender));
+        let stderr_task = tokio::spawn(parser::read_stderr(stderr, message_sender));
         let mut graph_task = Box::pin(tokio::task::spawn_blocking(move || {
             DependencyGraph::from_reader(SyncIoBridge::new(stdout))
         }));
@@ -212,7 +181,15 @@ impl<'tree> Builder<'tree> {
                 }
                 message = message_receiver.recv(), if !stderr_finished => {
                     match message {
-                        Some(message) => process_stderr_message(message, &mut report, &mut stderr_output),
+                        Some(message) => parser::process_stderr_message(
+                            message,
+                            &mut stderr_output,
+                            |event| {
+                                if let Some(progress) = Progress::from_event(event) {
+                                    report(progress);
+                                }
+                            },
+                        ),
                         None => stderr_finished = true,
                     }
                 }
@@ -245,94 +222,105 @@ impl<'tree> Builder<'tree> {
             });
         }
 
-        graph_result.map_err(OutputError::InvalidNixOutput)
+        let graph = graph_result.map_err(OutputError::InvalidNixOutput)?;
+        enrich_graph_with_metadata(&flake_url, graph, &mut report).await
     }
 }
 
-async fn read_stderr<R>(stderr: R, sender: UnboundedSender<StderrMessage>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut processor = parser::Processor::new();
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let message = match processor.process_line(&line) {
-            Ok(message) => message,
-            Err(_) => NixMessage::Text(line),
-        };
-        if sender.send(StderrMessage::Parsed(message)).is_err() {
-            break;
-        }
-    }
-}
+async fn enrich_graph_with_metadata(
+    flake_url: &str,
+    mut graph: DependencyGraph,
+    report: &mut impl FnMut(Progress),
+) -> Result<DependencyGraph, OutputError> {
+    let mut child = nix_command::command()
+        .args([
+            "eval",
+            "--json",
+            "--log-format",
+            "internal-json",
+            "--apply",
+            METADATA_EXPRESSION,
+            flake_url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| OutputError::NixFailed {
+            status: None,
+            stderr: error.to_string(),
+        })?;
 
-enum StderrMessage {
-    Parsed(NixMessage),
-}
+    let stdout = child.stdout.take().ok_or_else(|| OutputError::NixFailed {
+        status: None,
+        stderr: "nix metadata stdout was not captured".to_owned(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| OutputError::NixFailed {
+        status: None,
+        stderr: "nix metadata stderr was not captured".to_owned(),
+    })?;
+    let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
+    let stderr_task = tokio::spawn(parser::read_stderr(stderr, message_sender));
+    let mut metadata_task = Box::pin(tokio::task::spawn_blocking(move || {
+        let result = graph.apply_metadata_reader(SyncIoBridge::new(stdout));
+        (graph, result)
+    }));
+    let mut child_wait = Box::pin(child.wait());
+    let mut metadata_result = None;
+    let mut status_result = None;
+    let mut stderr_finished = false;
+    let mut stderr_output = String::new();
 
-fn process_stderr_message(
-    message: StderrMessage,
-    report: &mut impl FnMut(BuilderProgress),
-    stderr_output: &mut String,
-) {
-    match message {
-        StderrMessage::Parsed(message) => match message {
-            NixMessage::InputDownloadStarted { description, .. } => {
-                report(BuilderProgress::phase(
-                    QueryProgressKind::InputDownloadStarted,
-                    description,
-                ));
+    while metadata_result.is_none() || status_result.is_none() || !stderr_finished {
+        tokio::select! {
+            result = &mut metadata_task, if metadata_result.is_none() => {
+                metadata_result = Some(result);
             }
-            NixMessage::InputDownloadFinished { description, .. } => {
-                report(BuilderProgress::phase(
-                    QueryProgressKind::InputDownloadFinished,
-                    description,
-                ));
+            result = &mut child_wait, if status_result.is_none() => {
+                status_result = Some(result);
             }
-            NixMessage::DownloadProgress {
-                description,
-                done,
-                expected,
-                running,
-                failed,
-                ..
-            } => report(BuilderProgress {
-                kind: QueryProgressKind::InputDownloadProgress,
-                value: description,
-                done: Some(done),
-                expected: Some(expected),
-                running: Some(running),
-                failed: Some(failed),
-                graph: None,
-            }),
-            NixMessage::DownloadExpected {
-                description,
-                expected,
-                ..
-            } => report(BuilderProgress {
-                kind: QueryProgressKind::InputDownloadProgress,
-                value: description,
-                done: None,
-                expected: Some(expected),
-                running: None,
-                failed: None,
-                graph: None,
-            }),
-            NixMessage::EvaluationStarted { path, .. } => {
-                report(BuilderProgress::phase(
-                    QueryProgressKind::EvaluationStarted,
-                    path,
-                ));
-            }
-            NixMessage::Text(text) => {
-                if !text.is_empty() {
-                    stderr_output.push_str(&text);
-                    stderr_output.push('\n');
+            message = message_receiver.recv(), if !stderr_finished => {
+                match message {
+                    Some(message) => parser::process_stderr_message(
+                        message,
+                        &mut stderr_output,
+                        |event| {
+                            if let Some(progress) = Progress::from_event(event) {
+                                report(progress);
+                            }
+                        },
+                    ),
+                    None => stderr_finished = true,
                 }
             }
-            NixMessage::ActivityStarted { .. }
-            | NixMessage::ActivityStopped { .. }
-            | NixMessage::ActivityResult { .. } => {}
-        },
+        }
     }
+
+    stderr_task.await.map_err(|_| OutputError::NixFailed {
+        status: status_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()?.code()),
+        stderr: "nix metadata stderr reader task panicked".to_owned(),
+    })?;
+
+    let status = status_result
+        .expect("the metadata process wait future must complete before the query loop exits")
+        .map_err(|error| OutputError::NixFailed {
+            status: None,
+            stderr: error.to_string(),
+        })?;
+    let (graph, metadata_result) = metadata_result
+        .expect("the metadata deserialization task must complete before the query loop exits")
+        .map_err(|_| OutputError::NixFailed {
+            status: status.code(),
+            stderr: "nix metadata deserialization task panicked".to_owned(),
+        })?;
+    if !status.success() {
+        return Err(OutputError::NixFailed {
+            status: status.code(),
+            stderr: stderr_output,
+        });
+    }
+
+    metadata_result.map_err(OutputError::InvalidNixOutput)?;
+    Ok(graph)
 }

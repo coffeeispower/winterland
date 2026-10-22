@@ -1,14 +1,14 @@
+use super::nix_command;
 #[cfg(feature = "flutter_rust_bridge")]
 use crate::frb_generated::StreamSink;
-use crate::internal_json::{parser, types::Message as NixMessage};
+use crate::internal_json::{parser, Progress, ProgressKind};
 use crate::ShovelConfig;
 use bumpalo::Bump;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,64 +28,6 @@ pub enum Kind {
     Float,
     NumberString,
     String,
-}
-
-/// The phase of a query progress event.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb())]
-pub enum QueryProgressKind {
-    /// Nix started downloading or copying a flake input.
-    InputDownloadStarted,
-    /// Nix finished downloading or copying a flake input.
-    InputDownloadFinished,
-    /// Nix reported byte-level progress for an input download.
-    InputDownloadProgress,
-    /// Nix started evaluating an output path in the flake.
-    EvaluationStarted,
-    /// Nix finished querying the flake and the event contains the tree in the
-    /// Flutter bridge API.
-    Completed,
-}
-
-/// One progress event emitted while querying a flake.
-///
-/// Download descriptions are taken from Nix's internal JSON log messages and
-/// may vary between Nix versions. Native Rust callers receive the completed
-/// tree as the return value of `Tree::query`; Flutter callers receive it in
-/// the `tree` field of the final `completed` event because FRB represents a
-/// `StreamSink` function as a Dart stream.
-#[derive(Debug)]
-#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb())]
-pub struct QueryProgress {
-    /// The phase transition represented by this event.
-    pub kind: QueryProgressKind,
-    /// The input description or output path associated with the event.
-    pub value: String,
-    /// Number of bytes downloaded, when this is a byte-progress event.
-    pub done: Option<u64>,
-    /// Expected number of bytes, when known.
-    pub expected: Option<u64>,
-    /// Number of active transfers reported by Nix.
-    pub running: Option<u64>,
-    /// Number of failed transfers reported by Nix.
-    pub failed: Option<u64>,
-    /// The completed tree for [`QueryProgressKind::Completed`].
-    pub tree: Option<Tree>,
-}
-
-impl QueryProgress {
-    fn phase(kind: QueryProgressKind, value: String) -> Self {
-        Self {
-            kind,
-            value,
-            done: None,
-            expected: None,
-            running: None,
-            failed: None,
-            tree: None,
-        }
-    }
 }
 
 /// The minimal representation needed while converting `nix flake show` JSON.
@@ -123,17 +65,65 @@ pub struct Node<'arena> {
 }
 
 impl<'arena> Node<'arena> {
-    /// Equivalent to Zig's `Node.buildNodeName`.
+    /// Builds the output path from the leaf node, walking up the tree until it reaches the root.
     #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(ignore))]
     pub fn build_node_name(&self) -> String {
-        let mut names = Vec::new();
+        let mut length = 0usize;
+        let mut segment_count = 0usize;
         let mut current = Some(self);
         while let Some(node) = current {
-            names.push(node.name);
+            length += node.name.len();
+            segment_count += 1;
             current = node.parent.map(|parent| unsafe { &*parent });
         }
-        names.reverse();
-        names.join(".")
+
+        let length = length + segment_count.saturating_sub(1);
+        let mut output = Vec::with_capacity(length);
+        {
+            let output_bytes = output.spare_capacity_mut();
+            let mut end = length;
+            let mut current = Some(self);
+            while let Some(node) = current {
+                let name_end = end;
+                let name_start = name_end.checked_sub(node.name.len()).expect(
+                    "BUG CHECK: build_node_name capacity is too small and can't fit all the node names",
+                );
+                let parent = node.parent;
+
+                if parent.is_some() {
+                    end = name_start
+                        .checked_sub(1)
+                        .expect("BUG CHECK: build_node_name capacity is too small and can't fit all the node names");
+                    output_bytes[end].write(b'.');
+                } else {
+                    end = name_start;
+                }
+
+                for (slot, byte) in output_bytes[name_start..name_end]
+                    .iter_mut()
+                    .zip(node.name.as_bytes())
+                {
+                    slot.write(*byte);
+                }
+
+                current = parent.map(|parent| unsafe { &*parent });
+                if end == 0 {
+                    break;
+                }
+            }
+
+            debug_assert_eq!(end, 0);
+        }
+
+        // SAFETY: Every slot in the vector was initialized through
+        // `spare_capacity_mut` above before the length was set.
+        unsafe {
+            output.set_len(length);
+        }
+
+        // SAFETY: Every non-separator byte came from a node name, which is a
+        // valid UTF-8 string, and every separator byte is ASCII.
+        unsafe { String::from_utf8_unchecked(output) }
     }
 }
 
@@ -194,20 +184,21 @@ impl Tree {
     #[cfg(feature = "flutter_rust_bridge")]
     pub async fn query(
         config: &ShovelConfig,
-        sink: StreamSink<QueryProgress>,
+        sink: StreamSink<Progress>,
     ) -> Result<(), OutputError> {
         let tree = Self::query_with_progress(config, |event| {
             let _ = sink.add(event);
         })
         .await?;
-        let _ = sink.add(QueryProgress {
-            kind: QueryProgressKind::Completed,
+        let _ = sink.add(Progress {
+            kind: ProgressKind::Completed,
             value: String::new(),
             done: None,
             expected: None,
             running: None,
             failed: None,
             tree: Some(tree),
+            graph: None,
         });
         // FRB exposes StreamSink functions as Dart streams. The completed tree
         // is therefore delivered by the final event above.
@@ -219,27 +210,28 @@ impl Tree {
     #[cfg(not(feature = "flutter_rust_bridge"))]
     pub async fn query(
         config: &ShovelConfig,
-        mut on_progress: impl FnMut(QueryProgress),
+        mut on_progress: impl FnMut(Progress),
     ) -> Result<Self, OutputError> {
         let tree = Self::query_with_progress(config, &mut on_progress).await?;
-        on_progress(QueryProgress {
-            kind: QueryProgressKind::Completed,
+        on_progress(Progress {
+            kind: ProgressKind::Completed,
             value: String::new(),
             done: None,
             expected: None,
             running: None,
             failed: None,
             tree: None,
+            graph: None,
         });
         Ok(tree)
     }
 
     async fn query_with_progress(
         config: &ShovelConfig,
-        mut report: impl FnMut(QueryProgress),
+        mut report: impl FnMut(Progress),
     ) -> Result<Self, OutputError> {
         let flake = format!("path:{}", config.flake_path());
-        let mut child = Command::new("nix")
+        let mut child = nix_command::command()
             .args([
                 "flake",
                 "show",
@@ -266,7 +258,7 @@ impl Tree {
             stderr: "nix stderr was not captured".to_owned(),
         })?;
         let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
-        let stderr_task = tokio::spawn(read_stderr(stderr, message_sender));
+        let stderr_task = tokio::spawn(parser::read_stderr(stderr, message_sender));
         let mut stdout_output = Vec::new();
         let mut stdout_read = Box::pin(stdout.read_to_end(&mut stdout_output));
         let mut child_wait = Box::pin(child.wait());
@@ -285,7 +277,15 @@ impl Tree {
                 }
                 message = message_receiver.recv(), if !stderr_finished => {
                     match message {
-                        Some(message) => process_stderr_message(message, &mut report, &mut stderr_output),
+                        Some(message) => parser::process_stderr_message(
+                            message,
+                            &mut stderr_output,
+                            |event| {
+                                if let Some(progress) = Progress::from_event(event) {
+                                    report(progress);
+                                }
+                            },
+                        ),
                         None => stderr_finished = true,
                     }
                 }
@@ -407,94 +407,6 @@ impl Tree {
         let root = self.root();
         println!("{} [{:?}]", root.name, root.kind);
         print_children(root.children, &mut String::new());
-    }
-}
-
-enum StderrMessage {
-    Parsed(NixMessage),
-}
-
-async fn read_stderr<R>(stderr: R, sender: UnboundedSender<StderrMessage>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut processor = parser::Processor::new();
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let message = match processor.process_line(&line) {
-            Ok(message) => message,
-            Err(_) => NixMessage::Text(line),
-        };
-        if sender.send(StderrMessage::Parsed(message)).is_err() {
-            break;
-        }
-    }
-}
-
-fn process_stderr_message(
-    message: StderrMessage,
-    report: &mut impl FnMut(QueryProgress),
-    stderr_output: &mut String,
-) {
-    match message {
-        StderrMessage::Parsed(message) => match message {
-            NixMessage::InputDownloadStarted { description, .. } => {
-                report(QueryProgress::phase(
-                    QueryProgressKind::InputDownloadStarted,
-                    description,
-                ));
-            }
-            NixMessage::InputDownloadFinished { description, .. } => {
-                report(QueryProgress::phase(
-                    QueryProgressKind::InputDownloadFinished,
-                    description,
-                ));
-            }
-            NixMessage::DownloadProgress {
-                description,
-                done,
-                expected,
-                running,
-                failed,
-                ..
-            } => report(QueryProgress {
-                kind: QueryProgressKind::InputDownloadProgress,
-                value: description,
-                done: Some(done),
-                expected: Some(expected),
-                running: Some(running),
-                failed: Some(failed),
-                tree: None,
-            }),
-            NixMessage::DownloadExpected {
-                description,
-                expected,
-                ..
-            } => report(QueryProgress {
-                kind: QueryProgressKind::InputDownloadProgress,
-                value: description,
-                done: None,
-                expected: Some(expected),
-                running: None,
-                failed: None,
-                tree: None,
-            }),
-            NixMessage::EvaluationStarted { path, .. } => {
-                report(QueryProgress::phase(
-                    QueryProgressKind::EvaluationStarted,
-                    path,
-                ));
-            }
-            NixMessage::Text(text) => {
-                if !text.is_empty() {
-                    stderr_output.push_str(&text);
-                    stderr_output.push('\n');
-                }
-            }
-            NixMessage::ActivityStarted { .. }
-            | NixMessage::ActivityStopped { .. }
-            | NixMessage::ActivityResult { .. } => {}
-        },
     }
 }
 

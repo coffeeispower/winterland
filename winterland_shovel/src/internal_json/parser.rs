@@ -2,6 +2,110 @@
 
 use super::types::{Event, Field, Message};
 use std::collections::BTreeMap;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
+
+/// A progress event normalized from a Nix internal JSON message.
+#[derive(Debug)]
+pub enum ProgressEvent {
+    /// Nix started downloading or copying an input.
+    InputDownloadStarted(String),
+    /// Nix finished downloading or copying an input.
+    InputDownloadFinished(String),
+    /// Nix reported byte-level download progress.
+    DownloadProgress {
+        description: String,
+        done: u64,
+        expected: u64,
+        running: u64,
+        failed: u64,
+    },
+    /// Nix reported the expected download size.
+    DownloadExpected { description: String, expected: u64 },
+    /// Nix started evaluating an output path.
+    EvaluationStarted(String),
+    /// An ordinary stderr line.
+    Text(String),
+}
+
+/// Converts a parsed Nix message into the progress event shared by commands.
+pub fn progress_event(message: Message) -> Option<ProgressEvent> {
+    match message {
+        Message::InputDownloadStarted { description, .. } => {
+            Some(ProgressEvent::InputDownloadStarted(description))
+        }
+        Message::InputDownloadFinished { description, .. } => {
+            Some(ProgressEvent::InputDownloadFinished(description))
+        }
+        Message::DownloadProgress {
+            description,
+            done,
+            expected,
+            running,
+            failed,
+            ..
+        } => Some(ProgressEvent::DownloadProgress {
+            description,
+            done,
+            expected,
+            running,
+            failed,
+        }),
+        Message::DownloadExpected {
+            description,
+            expected,
+            ..
+        } => Some(ProgressEvent::DownloadExpected {
+            description,
+            expected,
+        }),
+        Message::EvaluationStarted { path, .. } => Some(ProgressEvent::EvaluationStarted(path)),
+        Message::Text(text) => Some(ProgressEvent::Text(text)),
+        Message::ActivityStarted { .. }
+        | Message::ActivityStopped { .. }
+        | Message::ActivityResult { .. } => None,
+    }
+}
+
+/// Reads Nix's stderr stream, parses each line, and sends interpreted
+/// messages to the caller as they arrive.
+pub async fn read_stderr<R>(stderr: R, sender: UnboundedSender<Message>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut processor = Processor::new();
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let message = match processor.process_line(&line) {
+            Ok(message) => message,
+            Err(_) => Message::Text(line),
+        };
+        if sender.send(message).is_err() {
+            break;
+        }
+    }
+}
+
+/// Dispatches one interpreted stderr message as progress or diagnostic text.
+pub fn process_stderr_message(
+    message: Message,
+    stderr_output: &mut String,
+    mut report: impl FnMut(ProgressEvent),
+) {
+    let Some(event) = progress_event(message) else {
+        return;
+    };
+
+    match event {
+        ProgressEvent::Text(text) => {
+            if !text.is_empty() {
+                stderr_output.push_str(&text);
+                stderr_output.push('\n');
+            }
+        }
+        event => report(event),
+    }
+}
 
 /// Parses one line from a Nix process using `--log-format internal-json`.
 ///

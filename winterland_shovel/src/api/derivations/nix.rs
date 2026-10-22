@@ -6,6 +6,16 @@ pub(super) struct Document {
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct Metadata {
+    pub(super) source: Option<String>,
+    #[serde(rename = "displayName")]
+    pub(super) display_name: Option<String>,
+    pub(super) website: Option<String>,
+    pub(super) repository: Option<String>,
+    pub(super) version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct Derivation {
     pub(super) args: Vec<String>,
     pub(super) builder: String,
@@ -61,6 +71,11 @@ impl From<Derivation> for super::Derivation {
                 .collect(),
             source_inputs: derivation.inputs.srcs,
             name: derivation.name,
+            source_location: None,
+            display_name: None,
+            website: None,
+            repository: None,
+            version: None,
             outputs: derivation
                 .outputs
                 .into_iter()
