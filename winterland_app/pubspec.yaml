@@ -21,10 +21,14 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  file_selector: ^1.1.0
   flutter:
     sdk: flutter
   flutter_rust_bridge: 2.13.0
   flutter_rust_bridge_hooks: 2.13.0
+  gap: ^3.0.1
+  lucide_icons_flutter: ^4.0.1
+  wide_color_tool: ^2.0.0
 
 dev_dependencies:
   flutter_test:
@@ -46,7 +50,7 @@ flutter:
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
   # the material Icons class.
-  uses-material-design: true
+  uses-material-design: false
 
   # To add assets to your application, add an assets section, like this:
   # assets:
